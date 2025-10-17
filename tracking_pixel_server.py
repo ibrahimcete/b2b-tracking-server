@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tracking Pixel Server - Ana PC Uyumlu
-FastAPI tabanlı asenkron, performanslı ve güvenli email tracking çözümü
-Sadece müşteri maili açtığında sinyal gönderir, kendi mailimizi açtığımızda gitmez
+Tracking Pixel Server - Raspberry Pi Uyumlu
+FastAPI tabanlı asenkron, performanslı ve güvenli tracking server
 """
 
 from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from contextlib import asynccontextmanager
 import uvicorn
 import io
 import json
@@ -22,73 +22,80 @@ import asyncio
 from user_agents import parse as parse_user_agent
 import requests
 from tracking_database import TrackingDatabase
-import re
-from contextlib import asynccontextmanager
 
 # Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('tracking_server_main_pc.log'),
+        logging.FileHandler('tracking_server.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# CORS Middleware will be added after FastAPI app creation
-
 # Database
 db = TrackingDatabase()
 
-# Config
-try:
-    with open("config.json", "r", encoding='utf-8') as f:
-        CONFIG = json.load(f)
-except Exception as e:
-    logger.error(f"Config yükleme hatası: {e}")
-    CONFIG = {}
+# Config - Railway environment variables veya local config.json
+import os
 
-# Kendi email adreslerimiz (sinyal göndermeyeceğimiz adresler)
-OWN_EMAIL_ADDRESSES = [
-    CONFIG.get("smtp_email", "ibrahimcete@trsatis.com"),  # Kendi email adresiniz
-    "ibrahimcete@trsatis.com",  # Manuel olarak da ekleyin
-]
+# Railway environment variables kontrolü
+if os.getenv('RAILWAY_ENVIRONMENT'):
+    # Railway deployment - Environment variables kullan
+    CONFIG = {
+        "main_pc_api_url": os.getenv("MAIN_API_URL", "http://localhost:8000"),
+        "main_pc_api_key": os.getenv("API_KEY", "b2b_cetei_secure_key_2024")
+    }
+    logger.info("🚂 Railway environment variables yüklendi")
+else:
+    # Local development - config.json kullan
+    try:
+        with open("config.json", "r", encoding='utf-8') as f:
+            CONFIG = json.load(f)
+        logger.info("💻 Local config.json yüklendi")
+    except Exception as e:
+        logger.error(f"Config yükleme hatası: {e}")
+        CONFIG = {}
 
-# Kendi IP adreslerimiz (sinyal göndermeyeceğimiz IP'ler)
-# NOT: 127.0.0.1 ve localhost kaldırıldı - test için gerekli
-OWN_IP_ADDRESSES = [
-    # "127.0.0.1",  # Test için kaldırıldı
-    # "localhost",  # Test için kaldırıldı
-    "192.168.1.1",  # Kendi IP adresinizi buraya ekleyin
-    "10.0.0.1",     # Diğer kendi IP adreslerinizi buraya ekleyin
-]
+MAIN_API_URL = CONFIG.get("main_pc_api_url", "http://localhost:8000")
+API_KEY = CONFIG.get("main_pc_api_key", "b2b_cetei_secure_key_2024")
 
-# Lifespan context manager
+# Lifespan event handler (modern FastAPI)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Server başlatma ve kapatma işlemleri"""
     # Startup
+    import os
+    is_railway = os.getenv('RAILWAY_ENVIRONMENT') is not None
+    
     logger.info("=" * 80)
-    logger.info("🚀 TRACKING PIXEL SERVER BAŞLATILIYOR - ANA PC")
+    logger.info("🚀 TRACKING PIXEL SERVER BAŞLATILIYOR")
     logger.info("=" * 80)
     logger.info(f"📊 Database: tracking.db")
-    logger.info(f"🌐 Mode: Main PC Optimized")
+    logger.info(f"{'🚂 Mode: Railway Cloud Deployment' if is_railway else '💻 Mode: Windows PC Local'}")
     logger.info(f"⚡ Async: Enabled")
-    logger.info(f"🔒 Filtering: Enabled (Own emails/IPs filtered)")
-    logger.info(f"📧 Own Emails: {len(OWN_EMAIL_ADDRESSES)}")
-    logger.info(f"🌐 Own IPs: {len(OWN_IP_ADDRESSES)}")
+    logger.info(f"📡 Ana API: {MAIN_API_URL} (opsiyonel)")
+    if is_railway:
+        logger.info(f"🌐 Railway Project ID: {os.getenv('RAILWAY_PROJECT_ID', 'N/A')}")
+        logger.info(f"🔧 Railway Environment: {os.getenv('RAILWAY_ENVIRONMENT_NAME', 'production')}")
     logger.info("=" * 80)
+    logger.info("✅ Server hazır!")
+    
     yield
+    
     # Shutdown
     logger.info("🛑 Server kapatılıyor...")
-    db.close()
+    global db
+    if db:
+        db.close()
     logger.info("✅ Database bağlantısı kapatıldı")
 
 # FastAPI App
 app = FastAPI(
-    title="B2B Tracking Pixel Server - Ana PC",
-    description="Ana PC uyumlu asenkron email tracking sistemi",
-    version="2.1.0",
+    title="B2B Tracking Pixel Server",
+    description="Windows PC - Asenkron email tracking sistemi",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -101,8 +108,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Gzip Compression
+# Gzip Compression (Raspberry Pi bandwidth tasarrufu)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 
 # ==================== PYDANTIC MODELS ====================
 
@@ -131,8 +139,45 @@ def create_transparent_pixel() -> bytes:
     return img_io.getvalue()
 
 
-# Pixel cache (her seferinde oluşturmamak için)
+def create_mini_logo() -> bytes:
+    """
+    16x16 mini tracking logo oluştur
+    
+    Mail clientların "görseller yüklensin mi?" diye sormaması için
+    küçük ama görünür bir logo döndürür.
+    
+    Logo: Basit mavi nokta (B2B marka rengi)
+    """
+    try:
+        # 16x16 boyutunda transparent background
+        img = Image.new('RGBA', (16, 16), (0, 0, 0, 0))
+        
+        # Mavi nokta çiz (B2B marka rengi: #0d7377)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        
+        # Merkeze mavi daire çiz (görünür ama ince)
+        # Renk: RGB(13, 115, 119) - B2B Mavi
+        # Alpha: 180 (orta şeffaflık - mail'de görünür)
+        circle_color = (13, 115, 119, 180)
+        
+        # 16x16'lık alanda 12x12 daire (2px margin)
+        draw.ellipse([2, 2, 14, 14], fill=circle_color)
+        
+        # PNG olarak kaydet
+        img_io = io.BytesIO()
+        img.save(img_io, 'PNG', optimize=True)
+        return img_io.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Mini logo oluşturma hatası: {e}")
+        # Hata olursa transparent pixel döndür
+        return create_transparent_pixel()
+
+
+# Cache'ler (her seferinde oluşturmamak için)
 PIXEL_CACHE = create_transparent_pixel()
+LOGO_CACHE = create_mini_logo()
 
 
 def extract_client_info(request: Request) -> Dict:
@@ -158,43 +203,17 @@ def extract_client_info(request: Request) -> Dict:
     }
 
 
-def is_own_email_or_ip(to_email: str, ip_address: str) -> bool:
-    """
-    Kendi email adresimizi veya IP'mizi kontrol et
-    Sadece müşteri maili açtığında sinyal gönder
-    
-    TEST MODU: Tüm emailler track ediliyor
-    """
-    # TEST İÇİN FİLTRELEME KAPALI - TÜM EMAİLLER TRACK EDİLİYOR
-    logger.info(f"🔓 TEST MODU: Tüm emailler track ediliyor - {to_email}")
-    return False
-    
-    # Email adresi kontrolü (devre dışı - test için)
-    # to_email_lower = to_email.lower()
-    # for own_email in OWN_EMAIL_ADDRESSES:
-    #     if own_email and own_email.lower() in to_email_lower:
-    #         logger.info(f"🚫 Kendi email adresimiz tespit edildi: {to_email} - Sinyal gönderilmiyor")
-    #         return True
-    
-    # IP adresi kontrolü (devre dışı - test için)
-    # for own_ip in OWN_IP_ADDRESSES:
-    #     if own_ip in ip_address:
-    #         logger.info(f"🚫 Kendi IP adresimiz tespit edildi: {ip_address} - Sinyal gönderilmiyor")
-    #         return True
-    
-    # return False
-
-
 async def notify_main_api(endpoint: str, data: Dict, method: str = 'POST'):
-    """Ana API'ye asenkron bildirim gönder"""
+    """
+    Ana API'ye asenkron bildirim gönder
+    
+    NOT: Ana API opsiyonel - bağlantı hatası tracking'i durdurmaz
+    """
     try:
-        main_api_url = CONFIG.get("main_pc_api_url", "http://localhost:8000")
-        api_key = CONFIG.get("main_pc_api_key", "b2b_cetei_secure_key_2024")
-        
-        url = f"{main_api_url}{endpoint}"
+        url = f"{MAIN_API_URL}{endpoint}"
         headers = {
             'Content-Type': 'application/json',
-            'X-API-Key': api_key
+            'X-API-Key': API_KEY
         }
         
         # Asyncio ile HTTP request
@@ -203,29 +222,30 @@ async def notify_main_api(endpoint: str, data: Dict, method: str = 'POST'):
         if method.upper() == 'POST':
             response = await loop.run_in_executor(
                 None,
-                lambda: requests.post(url, json=data, headers=headers, timeout=5)
+                lambda: requests.post(url, json=data, headers=headers, timeout=3)
             )
         elif method.upper() == 'GET':
             response = await loop.run_in_executor(
                 None,
-                lambda: requests.get(url, headers=headers, timeout=5)
+                lambda: requests.get(url, headers=headers, timeout=3)
             )
         else:
-            logger.error(f"Desteklenmeyen HTTP metodu: {method}")
+            logger.debug(f"Desteklenmeyen HTTP metodu: {method}")
             return False
         
         if response.status_code in [200, 201]:
-            logger.info(f"✅ Ana API bildirimi başarılı: {endpoint}")
+            logger.debug(f"✅ Ana API bildirimi başarılı: {endpoint}")
             return True
         else:
-            logger.warning(f"⚠️ Ana API hatası: {response.status_code}")
+            logger.debug(f"⚠️ Ana API hatası: {response.status_code}")
             return False
             
     except requests.exceptions.ConnectionError:
-        logger.error(f"❌ Ana API'ye bağlanılamadı: {main_api_url}")
+        # Sessizce hata logla - Ana API kapalı olabilir, bu normal
+        logger.debug(f"Ana API bağlantı hatası (normal): {MAIN_API_URL}")
         return False
     except Exception as e:
-        logger.error(f"❌ Ana API bildirimi hatası: {e}")
+        logger.debug(f"Ana API bildirimi hatası: {e}")
         return False
 
 
@@ -256,23 +276,18 @@ async def check_rate_limit(request: Request, endpoint: str) -> bool:
 async def root():
     """Ana sayfa"""
     return {
-        "service": "B2B Tracking Pixel Server - Ana PC",
-        "version": "2.1.0",
-        "mode": "Main PC Optimized",
-        "status": "running",
-        "features": [
-            "Email open tracking",
-            "Link click tracking",
-            "Unsubscribe management",
-            "Real-time analytics",
-            "Rate limiting",
-            "Async processing",
-            "Own email/IP filtering"
-        ],
-        "filtering": {
-            "own_emails": OWN_EMAIL_ADDRESSES,
-            "own_ips": OWN_IP_ADDRESSES
-        }
+            "service": "B2B Tracking Pixel Server",
+            "version": "2.0.0",
+            "mode": "Windows PC",
+            "status": "running",
+            "features": [
+                "Email open tracking (1x1 pixel)",
+                "Link click tracking",
+                "Unsubscribe management",
+                "Real-time analytics",
+                "Rate limiting",
+                "Async processing"
+            ]
     }
 
 
@@ -283,17 +298,21 @@ async def health_check():
         # Database bağlantı testi
         stats = db.get_overall_stats()
         
+        # NOT: Ana API kontrolü kaldırıldı - sürekli error loglarını önlemek için
+        # Tracking server bağımsız çalışabilir, ana API optional
+        
+        import os
+        is_railway = os.getenv('RAILWAY_ENVIRONMENT') is not None
+        
         return {
             'status': 'healthy',
-            'service': 'Tracking Pixel Server - Ana PC',
-            'version': '2.1.0',
+            'service': 'Tracking Pixel Server',
+            'version': '2.0.0',
             'timestamp': datetime.now().isoformat(),
             'database': 'connected',
             'total_emails_tracked': stats.get('total_sent', 0),
-            'mode': 'main_pc_optimized',
-            'filtering_enabled': True,
-            'own_emails_count': len(OWN_EMAIL_ADDRESSES),
-            'own_ips_count': len(OWN_IP_ADDRESSES)
+            'mode': 'railway_cloud' if is_railway else 'windows_pc',
+            'deployment': 'Railway.app' if is_railway else 'Local'
         }
     except Exception as e:
         logger.error(f"Health check hatası: {e}")
@@ -309,8 +328,17 @@ async def register_email(email_data: EmailRegistration, background_tasks: Backgr
     Email gönderim kaydı
     EmailManager tarafından çağrılır
     """
+    logger.info("=" * 80)
+    logger.info("📨 YENİ EMAIL KAYIT TALEBİ GELDİ!")
+    logger.info("=" * 80)
+    logger.info(f"   Tracking ID: {email_data.tracking_id}")
+    logger.info(f"   Firm ID: {email_data.firm_id}")
+    logger.info(f"   Alıcı: {email_data.to_email}")
+    logger.info(f"   Konu: {email_data.subject[:50]}...")
+    
     try:
         # Database'e kaydet
+        logger.info(f"\n📍 Database'e kaydediliyor...")
         success = db.register_email(
             tracking_id=email_data.tracking_id,
             firm_id=email_data.firm_id,
@@ -319,10 +347,31 @@ async def register_email(email_data: EmailRegistration, background_tasks: Backgr
             body=email_data.body
         )
         
+        if success:
+            logger.info(f"   ✅ Database kaydı BAŞARILI!")
+        else:
+            logger.error(f"   ❌ Database kaydı BAŞARISIZ!")
+        
         if not success:
+            logger.error(f"   ❌ HATA: Email kaydedilemedi!")
             raise HTTPException(status_code=500, detail="Email kaydedilemedi")
         
-        logger.info(f"📧 Email kaydedildi: {email_data.tracking_id}")
+        # Ana API'ye bildirim (opsiyonel - background task)
+        background_tasks.add_task(
+            notify_main_api,
+            '/api/tracking/register',
+            {
+                'tracking_id': email_data.tracking_id,
+                'firm_id': email_data.firm_id,
+                'to_email': email_data.to_email,
+                'subject': email_data.subject,
+                'sent_at': email_data.sent_at or datetime.now().isoformat()
+            }
+        )
+        
+        logger.info(f"\n✅ EMAIL KAYDI TAMAMLANDI!")
+        logger.info(f"   Tracking ID: {email_data.tracking_id}")
+        logger.info("=" * 80)
         
         return {
             'status': 'success',
@@ -330,9 +379,23 @@ async def register_email(email_data: EmailRegistration, background_tasks: Backgr
             'message': 'Email registered successfully'
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Email kayıt hatası: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Email kayıt hatası: {e}")
+        logger.error(f"   Hata detayı: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # JSON formatında hata döndür (HTML değil!)
+        return JSONResponse(
+            status_code=500,
+            content={
+                'status': 'error',
+                'error': str(e),
+                'message': 'Email kaydedilemedi'
+            }
+        )
 
 
 @app.get("/track/{tracking_id}.png")
@@ -344,61 +407,94 @@ async def track_email_open(
     """
     Email açılma tracking pixel
     Email açıldığında bu endpoint çağrılır
-    SADECE MÜŞTERİ MAİLİ AÇILDIĞINDA SİNYAL GÖNDERİR
+    
+    NOT: ibrahimcete@trsatis.com adresine gönderilen maillerin açılması tracking'e kaydedilmez
+    (Gönderen kişinin kendi kontrolü için açması sayılmaz)
     """
+    logger.info("=" * 80)
+    logger.info("📧 PIXEL İSTEĞİ GELDİ!")
+    logger.info("=" * 80)
+    logger.info(f"   Tracking ID: {tracking_id}")
+    logger.info(f"   IP: {request.client.host if request.client else 'unknown'}")
+    logger.info(f"   User-Agent: {request.headers.get('User-Agent', 'unknown')[:50]}...")
+    
     try:
         # Rate limit kontrolü
+        logger.info(f"\n📍 ADIM 1: Rate limit kontrolü yapılıyor...")
         await check_rate_limit(request, f"/track/{tracking_id}")
         
         # İstek bilgilerini çıkar
+        logger.info(f"\n📍 ADIM 2: Client bilgileri çıkarılıyor...")
         client_info = extract_client_info(request)
+        logger.info(f"   IP: {client_info['ip_address']}")
+        logger.info(f"   Device: {client_info['device_type']}")
+        logger.info(f"   Browser: {client_info['browser']}")
         
-        # Email bilgilerini al
+        # FİLTRE: Bu mail'i kimin açtığını kontrol et
+        # Email tracking bilgilerini al
+        logger.info(f"\n📍 ADIM 3: Database'den email bilgileri alınıyor...")
+        logger.info(f"   Tracking ID: {tracking_id}")
         email_stats = db.get_email_stats(tracking_id)
-        if not email_stats:
-            logger.warning(f"⚠️ Tracking ID bulunamadı: {tracking_id}")
-            return Response(content=PIXEL_CACHE, media_type="image/png")
         
-        to_email = email_stats.get('to_email', '')
-        ip_address = client_info['ip_address']
+        if email_stats:
+            logger.info(f"   ✅ Email bulundu!")
+            logger.info(f"   Alıcı: {email_stats.get('to_email', 'N/A')}")
+            logger.info(f"   Konu: {email_stats.get('subject', 'N/A')[:50]}...")
+            logger.info(f"   Gönderim: {email_stats.get('sent_at', 'N/A')}")
+        else:
+            logger.warning(f"   ⚠️ Email bulunamadı! Tracking ID database'de yok: {tracking_id}")
         
-        # KENDİ EMAİL ADRESİMİZİ VEYA IP'MİZİ KONTROL ET
-        if is_own_email_or_ip(to_email, ip_address):
-            logger.info(f"🚫 Kendi email/IP'miz tespit edildi - Sinyal gönderilmiyor")
-            logger.info(f"   → Email: {to_email}")
-            logger.info(f"   → IP: {ip_address}")
-            # Pixel'i döndür ama database'e kaydetme
-            return Response(
-                content=PIXEL_CACHE,
-                media_type="image/png",
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0"
-                }
-            )
-        
-        # MÜŞTERİ MAİLİ AÇILDI - SİNYAL GÖNDER
-        logger.info(f"✅ Müşteri maili açıldı: {tracking_id} - {to_email}")
-        logger.info(f"   → IP: {ip_address}")
-        logger.info(f"   → Device: {client_info['device_type']}")
-        
-        # Database'e kaydet (direkt - background task sorunu için)
-        try:
-            # client_info'dan ip_address ve user_agent'ı çıkar
-            metadata = {k: v for k, v in client_info.items() if k not in ['ip_address', 'user_agent']}
+        if email_stats:
+            to_email = email_stats.get('to_email', '').lower()
             
-            db.record_open(
-                tracking_id=tracking_id,
-                ip_address=client_info['ip_address'],
-                user_agent=client_info['user_agent'],
-                **metadata
-            )
-            logger.info(f"✅ Database kaydı başarılı: {tracking_id}")
-        except Exception as e:
-            logger.error(f"❌ Database kayıt hatası: {e}")
+            logger.info(f"\n📍 ADIM 4: Email sahibi kontrolü")
+            logger.info(f"   Alıcı email: {to_email}")
+            
+            # Eğer gönderen kişinin kendi maili ise tracking kaydetme
+            if to_email == 'ibrahimcete@trsatis.com':
+                logger.info(f"   🔇 KENDİ MAİLİNİZ - Tracking kaydedilmeyecek!")
+                logger.info(f"   Sebep: Kendi kontrolünüz için açmanız gerçek müşteri açılması değil")
+                # Pixel döndür ama kayıt yapma
+                return Response(
+                    content=PIXEL_CACHE,
+                    media_type="image/png",
+                    headers={
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0"
+                    }
+                )
         
-        # Ana API'ye bildirim (background task)
+        # Müşteri maili - Normal tracking kaydı yap
+        logger.info(f"\n📍 ADIM 5: MÜŞTERİ MAİLİ - Tracking kaydediliyor!")
+        logger.info(f"   Tracking ID: {tracking_id}")
+        logger.info(f"   IP: {client_info.get('ip_address')}")
+        logger.info(f"   Device: {client_info.get('device_type')}")
+        logger.info(f"   Browser: {client_info.get('browser')}")
+        
+        # Database'e kaydet (background task)
+        logger.info(f"\n📍 ADIM 6: Database'e kayıt yapılıyor...")
+        try:
+            # Direkt kaydet (background task değil - hata görmek için)
+            success = db.record_open(
+                tracking_id,
+                client_info.get('ip_address'),
+                client_info.get('user_agent'),
+                device_type=client_info.get('device_type'),
+                browser=client_info.get('browser'),
+                os=client_info.get('os')
+            )
+            
+            if success:
+                logger.info(f"   ✅ Database kaydı BAŞARILI!")
+            else:
+                logger.error(f"   ❌ Database kaydı BAŞARISIZ!")
+        except Exception as e:
+            logger.error(f"   ❌ Database kayıt hatası: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # Ana API'ye bildirim (opsiyonel - background task)
         background_tasks.add_task(
             notify_main_api,
             '/api/tracking/sync',
@@ -408,13 +504,17 @@ async def track_email_open(
                     'opened_at': datetime.now().isoformat(),
                     'ip_address': client_info['ip_address'],
                     'user_agent': client_info['user_agent'],
-                    'device_type': client_info['device_type'],
-                    'to_email': to_email
+                    'device_type': client_info['device_type']
                 }]
             }
         )
         
-        # 1x1 transparent pixel döndür (cache'den)
+        logger.info(f"\n✅ TRACKING TAMAMLANDI!")
+        logger.info(f"   Tracking ID: {tracking_id}")
+        logger.info(f"   Device: {client_info['device_type']}")
+        logger.info("=" * 80)
+        
+        # 1x1 Transparent pixel döndür (standart tracking)
         return Response(
             content=PIXEL_CACHE,
             media_type="image/png",
@@ -429,7 +529,7 @@ async def track_email_open(
         raise
     except Exception as e:
         logger.error(f"Tracking pixel hatası: {e}")
-        # Hata olsa bile pixel döndür (tracking başarısız olsa bile email render olmalı)
+        # Hata olsa bile pixel döndür
         return Response(content=PIXEL_CACHE, media_type="image/png")
 
 
@@ -443,7 +543,6 @@ async def track_link_click(
     """
     Link tıklama tracking
     Email içindeki linkler tıklandığında bu endpoint çağrılır
-    SADECE MÜŞTERİ MAİLİ TIKLANDIĞINDA SİNYAL GÖNDERİR
     """
     try:
         # Rate limit kontrolü
@@ -452,36 +551,13 @@ async def track_link_click(
         # İstek bilgilerini çıkar
         client_info = extract_client_info(request)
         
-        # Email bilgilerini al
-        email_stats = db.get_email_stats(tracking_id)
-        if not email_stats:
-            logger.warning(f"⚠️ Tracking ID bulunamadı: {tracking_id}")
-            return RedirectResponse(url=url, status_code=302)
-        
-        to_email = email_stats.get('to_email', '')
-        ip_address = client_info['ip_address']
-        
-        # KENDİ EMAİL ADRESİMİZİ VEYA IP'MİZİ KONTROL ET
-        if is_own_email_or_ip(to_email, ip_address):
-            logger.info(f"🚫 Kendi email/IP'miz tespit edildi - Sinyal gönderilmiyor")
-            logger.info(f"   → Email: {to_email}")
-            logger.info(f"   → IP: {ip_address}")
-            # Yönlendir ama database'e kaydetme
-            return RedirectResponse(url=url, status_code=302)
-        
-        # MÜŞTERİ MAİLİ TIKLANDI - SİNYAL GÖNDER
-        logger.info(f"✅ Müşteri linki tıklandı: {tracking_id} - {to_email}")
-        logger.info(f"   → Link: {url[:50]}...")
-        logger.info(f"   → IP: {ip_address}")
-        
         # Database'e kaydet (background task)
         background_tasks.add_task(
             db.record_click,
             tracking_id,
             url,
             client_info['ip_address'],
-            client_info['user_agent'],
-            **client_info
+            client_info['user_agent']
         )
         
         # Ana API'ye bildirim (background task)
@@ -494,11 +570,12 @@ async def track_link_click(
                     'clicked_at': datetime.now().isoformat(),
                     'link_url': url,
                     'ip_address': client_info['ip_address'],
-                    'user_agent': client_info['user_agent'],
-                    'to_email': to_email
+                    'user_agent': client_info['user_agent']
                 }]
             }
         )
+        
+        logger.info(f"🖱️ Link tıklandı: {tracking_id} → {url[:50]}")
         
         # Kullanıcıyı hedef URL'e yönlendir
         return RedirectResponse(url=url, status_code=302)
@@ -726,7 +803,6 @@ async def cleanup_old_records(days: int = 90):
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
-    from fastapi.responses import JSONResponse
     return JSONResponse(
         status_code=404,
         content={
@@ -740,7 +816,6 @@ async def not_found_handler(request: Request, exc: HTTPException):
 @app.exception_handler(500)
 async def internal_error_handler(request: Request, exc: Exception):
     logger.error(f"Internal server error: {exc}")
-    from fastapi.responses import JSONResponse
     return JSONResponse(
         status_code=500,
         content={
@@ -751,28 +826,38 @@ async def internal_error_handler(request: Request, exc: Exception):
 
 
 # ==================== STARTUP & SHUTDOWN ====================
-# Note: Startup and shutdown events are now handled by the lifespan context manager above
+# Modern lifespan event handlers kullanılıyor (yukarıda tanımlı)
 
 
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
+    import os
+    
+    # Railway deployment kontrolü
+    is_railway = os.getenv('RAILWAY_ENVIRONMENT') is not None
+    port = int(os.getenv('PORT', 5000))
+    host = "0.0.0.0" if is_railway else "127.0.0.1"
+    
     print("=" * 80)
-    print("📧 B2B TRACKING PIXEL SERVER - ANA PC EDITION")
+    print(f"📧 B2B TRACKING PIXEL SERVER - {'RAILWAY CLOUD' if is_railway else 'WINDOWS PC'} EDITION")
     print("=" * 80)
     print("🚀 Server başlatılıyor...")
-    print("📝 API Docs: http://localhost:5000/docs")
-    print("📊 Health Check: http://localhost:5000/api/health")
-    print("🔒 Filtering: Sadece müşteri maili açtığında sinyal gönderir")
+    print(f"🌐 Host: {host}")
+    print(f"🔌 Port: {port}")
+    if not is_railway:
+        print(f"📝 API Docs: http://localhost:{port}/docs")
+        print(f"📊 Health Check: http://localhost:{port}/api/health")
     print("=" * 80)
     
     # Uvicorn ile başlat
     uvicorn.run(
-        "tracking_pixel_main_pc:app",
-        host="0.0.0.0",
-        port=5000,
-        reload=False,  # Production'da False
-        workers=1,  # Ana PC için 1 worker yeterli
+        "tracking_pixel_server:app",
+        host=host,
+        port=port,
+        reload=False,
+        workers=1,
         log_level="info",
         access_log=True
     )
+
